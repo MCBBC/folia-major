@@ -583,6 +583,7 @@ const VisualizerSpatial: React.FC<VisualizerSpatialProps & { staticMode?: boolea
     const { t } = useTranslation();
     const [now, setNow] = useState(() => currentTime.get());
     const lastNowUpdateRef = useRef(now);
+    const latestTimeRef = useRef(now);
     const contentRef = useRef<HTMLDivElement>(null);
     const [contentWidth, setContentWidth] = useState(1200);
     const intensityPreset = SPATIAL_INTENSITY_PRESETS[theme.animationIntensity];
@@ -593,30 +594,44 @@ const VisualizerSpatial: React.FC<VisualizerSpatialProps & { staticMode?: boolea
         getLineEndTime: getLineRenderEndTime,
     });
     useMotionValueEvent(currentTime, 'change', latest => {
-        const delta = latest - lastNowUpdateRef.current;
-
-        // Song switch / seek backward: sync immediately to avoid stale lyric states.
-        if (delta < 0) {
-            lastNowUpdateRef.current = latest;
-            setNow(latest);
-            return;
-        }
-
-        // Large forward seek should also skip throttling.
-        if (delta > 0.32) {
-            lastNowUpdateRef.current = latest;
-            setNow(latest);
-            return;
-        }
-
-        // Throttle normal playback updates to reduce React work.
-        if (delta < 0.028) {
-            return;
-        }
-
-        lastNowUpdateRef.current = latest;
-        setNow(latest);
+        latestTimeRef.current = latest;
     });
+
+    useEffect(() => {
+        let rafId = 0;
+
+        const syncNow = () => {
+            const latest = latestTimeRef.current;
+            const delta = latest - lastNowUpdateRef.current;
+
+            // Song switch / seek backward: sync immediately to avoid stale lyric states.
+            if (delta < 0) {
+                lastNowUpdateRef.current = latest;
+                setNow(latest);
+                rafId = requestAnimationFrame(syncNow);
+                return;
+            }
+
+            // Large forward seek should also skip throttling.
+            if (delta > 0.32) {
+                lastNowUpdateRef.current = latest;
+                setNow(latest);
+                rafId = requestAnimationFrame(syncNow);
+                return;
+            }
+
+            // Throttle normal playback updates to reduce React work.
+            if (delta >= 0.028) {
+                lastNowUpdateRef.current = latest;
+                setNow(latest);
+            }
+
+            rafId = requestAnimationFrame(syncNow);
+        };
+
+        rafId = requestAnimationFrame(syncNow);
+        return () => cancelAnimationFrame(rafId);
+    }, []);
 
     useEffect(() => {
         const element = contentRef.current;
