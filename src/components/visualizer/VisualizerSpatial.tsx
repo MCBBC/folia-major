@@ -36,6 +36,26 @@ const splitGraphemes = (text: string) => {
 };
 
 const isCJK = (text: string) => /[\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7af]/.test(text);
+const isLatinOrDigit = (text: string) => /[A-Za-z0-9]/.test(text);
+
+const getWordScriptProfile = (text: string) => {
+    const hasCJK = isCJK(text);
+    const hasLatin = isLatinOrDigit(text);
+    if (hasCJK && hasLatin) return 'mixed' as const;
+    if (hasCJK) return 'cjk' as const;
+    if (hasLatin) return 'latin' as const;
+    return 'other' as const;
+};
+
+const estimateWordWidthUnits = (graphemes: string[]) => {
+    if (graphemes.length === 0) return 1;
+    return graphemes.reduce((sum, grapheme) => {
+        if (/^\s+$/.test(grapheme)) return sum + 0.36;
+        if (isCJK(grapheme)) return sum + 1;
+        if (isLatinOrDigit(grapheme)) return sum + 0.64;
+        return sum + 0.82;
+    }, 0);
+};
 
 const getActiveColor = (wordText: string, theme: Theme) => {
     if (!theme.wordColors || theme.wordColors.length === 0) {
@@ -118,10 +138,10 @@ const SPATIAL_INTENSITY_PRESETS = {
 } as const;
 
 const getWordStatus = (time: number, word: Word, isCurrentLine: boolean) => {
-    if (!isCurrentLine) return 'ambient';
-    if (time < word.startTime) return 'waiting';
-    if (time <= word.endTime) return 'active';
-    return 'passed';
+    if (!isCurrentLine) return 'ambient' as const;
+    if (time < word.startTime) return 'waiting' as const;
+    if (time <= word.endTime) return 'active' as const;
+    return 'passed' as const;
 };
 
 const getWordRevealMode = (line: Line | null | undefined) => getLineRenderHints(line)?.wordRevealMode ?? 'normal';
@@ -163,6 +183,21 @@ const getWordProgress = (
     return clamp((time - word.startTime) / duration, 0, 1);
 };
 
+const getClassicGlowRadii = (wordRevealMode: 'normal' | 'fast' | 'instant') => {
+    if (wordRevealMode === 'instant') return { inner: 14, outer: 24 };
+    if (wordRevealMode === 'fast') return { inner: 18, outer: 32 };
+    return { inner: 20, outer: 40 };
+};
+
+const getClassicGlowPulse = (progress: number, wordRevealMode: 'normal' | 'fast' | 'instant') => {
+    const peakAt = wordRevealMode === 'instant' ? 0.35 : wordRevealMode === 'fast' ? 0.4 : 0.3;
+    const clampedProgress = clamp(progress, 0, 1);
+    if (clampedProgress <= peakAt) {
+        return clamp(clampedProgress / Math.max(peakAt, 0.01), 0, 1);
+    }
+    return clamp(1 - (clampedProgress - peakAt) / Math.max(1 - peakAt, 0.01), 0, 1);
+};
+
 const getSpatialWordStatus = (
     time: number,
     word: Word,
@@ -186,13 +221,19 @@ const SpatialWordCloud: React.FC<{
     audioPower: MotionValue<number>;
     now: number;
     horizontalScale: number;
-}> = ({ line, role, theme, lyricsFontScale, audioPower, now, horizontalScale }) => {
+    viewportWidth: number;
+}> = ({ line, role, theme, lyricsFontScale, audioPower, now, horizontalScale, viewportWidth }) => {
     const energy = clamp(audioPower.get() / 255, 0, 1);
     const isCurrentLine = role === 'current';
     const intensityPreset = SPATIAL_INTENSITY_PRESETS[theme.animationIntensity];
     const wordRevealMode = getWordRevealMode(line);
     const lineRenderEndTime = getLineRenderEndTime(line);
     const passedGlowHold = getPassedGlowHold(wordRevealMode, theme.animationIntensity);
+    const previousElapsed = Math.max(0, now - lineRenderEndTime);
+    const previousFadeWindow = wordRevealMode === 'instant' ? 0.32 : wordRevealMode === 'fast' ? 0.52 : 0.82;
+    const previousPresence = role === 'previous'
+        ? Math.pow(1 - clamp(previousElapsed / previousFadeWindow, 0, 1), 2.4)
+        : 1;
 
     const roleEnvelope = useMemo(() => {
         if (role === 'previous') return { z: 520, y: 82, opacity: 0.45, blur: 4 };
@@ -206,7 +247,7 @@ const SpatialWordCloud: React.FC<{
         const sequenceSpread = role === 'current'
             ? intensityPreset.sequenceSpreadCurrent
             : intensityPreset.sequenceSpreadOther;
-        return line.words.map((word, index) => {
+        const wordsMeta = line.words.map((word, index) => {
             const random = (offset: number) => {
                 const x = Math.sin(seed + index * 17.37 + offset) * 10000;
                 return x - Math.floor(x);
@@ -214,23 +255,76 @@ const SpatialWordCloud: React.FC<{
             const spreadBase = role === 'current' ? intensityPreset.spreadCurrent : intensityPreset.spreadOther;
             const normalized = count <= 1 ? 0 : (index / (count - 1)) * 2 - 1;
             const lanePush = normalized * spreadBase * 0.95;
-            const baseSequenceX = (index - (count - 1) / 2) * sequenceSpread;
             const antiCenterBias = Math.sign(normalized || (index % 2 === 0 ? 1 : -1)) * 34;
             const activeColor = getActiveColor(word.text, theme);
             const graphemes = splitGraphemes(word.text);
+            const scriptProfile = getWordScriptProfile(word.text);
+            const widthUnits = estimateWordWidthUnits(graphemes);
+            const estimatedWidth = Math.max(sequenceSpread * 0.62, widthUnits * sequenceSpread * 0.78);
             return {
                 id: `${line.startTime}-${index}-${word.text}`,
-                // Keep strict reading order: monotonic baseSequenceX + limited jitter.
-                x: baseSequenceX + lanePush * 0.5 + antiCenterBias + (random(1) - 0.5) * intensityPreset.jitterX,
+                lanePush,
+                antiCenterBias,
+                randomX: (random(1) - 0.5) * intensityPreset.jitterX,
                 y: (random(2) - 0.5) * intensityPreset.jitterY + (Math.abs(normalized) > 0.55 ? (random(6) - 0.5) * intensityPreset.edgeYBoost : 0),
                 z: (random(3) - 0.5) * intensityPreset.zRange + Math.abs(normalized) * intensityPreset.zEdgeBoost,
                 rotateZ: (random(4) - 0.5) * 10,
                 scale: 0.96 + random(5) * 0.28,
                 activeColor,
                 graphemes,
+                scriptProfile,
+                estimatedWidth,
             };
         });
+
+        // Responsive word packing: use estimated token width to avoid CJK/Latin overlap.
+        const centers: number[] = [];
+        let cursor = 0;
+        wordsMeta.forEach((meta, index) => {
+            if (index > 0) {
+                const prev = wordsMeta[index - 1]!;
+                const baseGap = sequenceSpread * 0.54;
+                const mixedGapBoost = prev.scriptProfile === 'mixed' || meta.scriptProfile === 'mixed' ? sequenceSpread * 0.1 : 0;
+                const scriptSwapBoost = prev.scriptProfile !== meta.scriptProfile ? sequenceSpread * 0.16 : 0;
+                const latinCjkBoost = (
+                    (prev.scriptProfile === 'latin' && meta.scriptProfile === 'cjk') ||
+                    (prev.scriptProfile === 'cjk' && meta.scriptProfile === 'latin')
+                ) ? sequenceSpread * 0.12 : 0;
+                cursor += baseGap + mixedGapBoost + scriptSwapBoost + latinCjkBoost;
+            }
+
+            const center = cursor + meta.estimatedWidth / 2;
+            centers.push(center);
+            cursor += meta.estimatedWidth;
+        });
+
+        const totalWidth = Math.max(cursor, sequenceSpread);
+        const halfWidth = totalWidth / 2;
+
+        return wordsMeta.map((meta, index) => ({
+            ...meta,
+            // Keep strict reading order: monotonic sequence centers + limited jitter.
+            x: (centers[index]! - halfWidth) + meta.lanePush * 0.5 + meta.antiCenterBias + meta.randomX,
+        }));
     }, [intensityPreset, line, role, theme]);
+
+    const overflowFitScale = useMemo(() => {
+        if (wordLayout.length === 0) return 1;
+        // Reserve side padding so tails/glows still stay visible.
+        const safeHalfViewport = Math.max(96, viewportWidth * 0.5 - 88);
+        let furthestEdge = 0;
+
+        for (const layout of wordLayout) {
+            const halfWord = layout.estimatedWidth * horizontalScale * 0.5;
+            const edge = Math.abs(layout.x * horizontalScale) + halfWord;
+            if (edge > furthestEdge) {
+                furthestEdge = edge;
+            }
+        }
+
+        if (furthestEdge <= safeHalfViewport) return 1;
+        return clamp(safeHalfViewport / furthestEdge, 0.48, 1);
+    }, [horizontalScale, viewportWidth, wordLayout]);
 
     const mainFontSize = `clamp(${(2.1 * lyricsFontScale).toFixed(3)}rem, ${(5.8 * lyricsFontScale).toFixed(3)}vw, ${(3.95 * lyricsFontScale).toFixed(3)}rem)`;
 
@@ -249,10 +343,14 @@ const SpatialWordCloud: React.FC<{
                 filter: role === 'next' ? 'blur(18px)' : role === 'previous' ? 'blur(2px)' : 'blur(10px)',
             }}
             animate={{
-                opacity: roleEnvelope.opacity,
+                opacity: roleEnvelope.opacity * previousPresence,
                 z: roleEnvelope.z,
                 y: roleEnvelope.y,
-                filter: roleEnvelope.blur > 0 ? `blur(${roleEnvelope.blur}px)` : 'blur(0px)',
+                filter: role === 'previous'
+                    ? `blur(${(roleEnvelope.blur + (1 - previousPresence) * 8).toFixed(2)}px)`
+                    : roleEnvelope.blur > 0
+                        ? `blur(${roleEnvelope.blur}px)`
+                        : 'blur(0px)',
             }}
             exit={{
                 opacity: 0,
@@ -269,69 +367,136 @@ const SpatialWordCloud: React.FC<{
                 const layout = wordLayout[index]!;
                 const activeEndTime = getWordActiveEndTime(word, lineRenderEndTime, wordRevealMode);
                 const status = getSpatialWordStatus(now, word, isCurrentLine, lineRenderEndTime, wordRevealMode);
+                const highlightStatus = getWordStatus(now, word, isCurrentLine);
                 const progress = getWordProgress(now, word, lineRenderEndTime, wordRevealMode);
                 const activeColor = layout.activeColor;
-                const passedElapsed = Math.max(0, now - activeEndTime);
-                const passedFade = status === 'passed'
+                const passedElapsed = Math.max(0, now - word.endTime);
+                const passedFade = highlightStatus === 'passed'
                     ? Math.pow(1 - clamp(passedElapsed / passedGlowHold, 0, 1), 2)
                     : 0;
-                const color = status === 'active'
+                const color = highlightStatus === 'active'
                     ? activeColor
-                    : status === 'passed'
+                    : highlightStatus === 'passed'
                         ? `color-mix(in srgb, ${activeColor} 72%, ${theme.primaryColor} 28%)`
                         : theme.secondaryColor;
-                const alpha = status === 'active'
+                const alpha = highlightStatus === 'active'
                     ? 1
-                    : status === 'passed'
+                    : highlightStatus === 'passed'
                         ? (0.62 + passedFade * 0.22)
                         : role === 'next'
                             ? 0.5
                             : 0.35;
-                const glow = status === 'active'
-                    ? 0.45 + (1 - progress) * 0.35 + energy * 0.2
-                    : status === 'passed'
-                        ? 0.22 + passedFade * (0.34 + energy * 0.12)
-                        : 0.06;
+                const targetZ = layout.z + (status === 'active' ? -36 : status === 'passed' ? 46 : intensityPreset.waitingWordDepth);
+                const depthBlur = highlightStatus === 'active'
+                    ? 0
+                    : clamp(Math.abs(targetZ) / 220, 0, 2.8);
+                const strokePulse = highlightStatus === 'active'
+                    ? (0.5 + Math.sin(progress * Math.PI) * 0.65 + energy * 0.3)
+                    : 0;
+                const glowRadii = getClassicGlowRadii(wordRevealMode);
+                const activeGlow = getClassicGlowPulse(progress, wordRevealMode);
+                const wordGlowStrength = Math.round(clamp(activeGlow * (0.92 + energy * 0.16), 0, 1) * 100);
+                const wordGlowTailStrength = Math.round(clamp(activeGlow * (0.82 + energy * 0.12), 0, 1) * 100);
+                const wordTextShadow = highlightStatus === 'active'
+                    ? `0 0 ${glowRadii.inner}px color-mix(in srgb, ${activeColor} ${wordGlowStrength}%, transparent), 0 0 ${glowRadii.outer}px color-mix(in srgb, ${activeColor} ${wordGlowTailStrength}%, transparent)`
+                    : 'none';
+                const trailOpacity = highlightStatus === 'active'
+                    ? clamp(0.16 + (1 - progress) * 0.14 + energy * 0.08, 0, 0.34)
+                    : 0;
                 const graphemes = layout.graphemes;
                 const glyphCount = Math.max(graphemes.length, 1);
 
-                const positionedX = layout.x * horizontalScale;
+                const positionedX = layout.x * horizontalScale * overflowFitScale;
 
                 return (
-                    <motion.span
-                        key={layout.id}
-                        className="absolute left-1/2 top-1/2 whitespace-nowrap font-bold"
-                        style={{
-                            fontSize: mainFontSize,
-                            color,
-                            transformStyle: 'preserve-3d',
-                            textShadow: `0 0 20px color-mix(in srgb, ${activeColor} ${Math.round(glow * 100)}%, transparent)`,
-                        }}
-                        initial={{
-                            x: positionedX * 1.12,
-                            y: layout.y + 26,
-                            z: layout.z + (role === 'next' ? intensityPreset.nextWordInitialZ : role === 'previous' ? 140 : -24),
-                            rotateZ: layout.rotateZ + 6,
-                            scale: role === 'next' ? Math.max(0.58, layout.scale - 0.34) : Math.max(0.75, layout.scale - 0.2),
-                            opacity: role === 'next' ? 0.04 : 0,
-                        }}
-                        animate={{
-                            x: positionedX,
-                            y: layout.y + (status === 'active' ? -2 : 0),
-                            z: layout.z + (status === 'active' ? -36 : status === 'passed' ? 46 : intensityPreset.waitingWordDepth),
-                            rotateZ: layout.rotateZ + (status === 'passed' ? 4 : 0),
-                            scale: layout.scale * (status === 'active' ? 1.08 + energy * 0.04 : status === 'waiting' ? 0.9 : 1),
-                            opacity: role === 'next' ? Math.min(alpha, 0.34) : alpha,
-                        }}
-                        transition={{
-                            duration: status === 'active' ? 0.14 : 0.36,
-                            ease: status === 'active' ? 'easeOut' : [0.2, 0.75, 0.25, 1],
-                        }}
-                    >
-                        {glyphCount <= 1 ? (
-                            word.text
-                        ) : (
-                            graphemes.map((grapheme, glyphIndex) => {
+                    <React.Fragment key={layout.id}>
+                        {trailOpacity > 0.01 && (
+                            <>
+                                <motion.span
+                                    className="absolute left-1/2 top-1/2 whitespace-nowrap font-bold"
+                                    style={{
+                                        fontSize: mainFontSize,
+                                        color: activeColor,
+                                        transformStyle: 'preserve-3d',
+                                        pointerEvents: 'none',
+                                        filter: 'blur(1.8px)',
+                                        textShadow: `0 0 ${glowRadii.inner}px color-mix(in srgb, ${activeColor} 55%, transparent)`,
+                                    }}
+                                    initial={false}
+                                    animate={{
+                                        x: positionedX - 14,
+                                        y: layout.y + 4,
+                                        z: targetZ + 10,
+                                        rotateZ: layout.rotateZ,
+                                        scale: layout.scale * 1.03,
+                                        opacity: trailOpacity * 0.7,
+                                    }}
+                                    transition={{ duration: 0.16, ease: 'easeOut' }}
+                                >
+                                    {word.text}
+                                </motion.span>
+                                <motion.span
+                                    className="absolute left-1/2 top-1/2 whitespace-nowrap font-bold"
+                                    style={{
+                                        fontSize: mainFontSize,
+                                        color: activeColor,
+                                        transformStyle: 'preserve-3d',
+                                        pointerEvents: 'none',
+                                        filter: 'blur(2.6px)',
+                                        textShadow: `0 0 ${glowRadii.outer}px color-mix(in srgb, ${activeColor} 42%, transparent)`,
+                                    }}
+                                    initial={false}
+                                    animate={{
+                                        x: positionedX - 22,
+                                        y: layout.y + 8,
+                                        z: targetZ + 16,
+                                        rotateZ: layout.rotateZ,
+                                        scale: layout.scale * 1.06,
+                                        opacity: trailOpacity * 0.45,
+                                    }}
+                                    transition={{ duration: 0.2, ease: 'easeOut' }}
+                                >
+                                    {word.text}
+                                </motion.span>
+                            </>
+                        )}
+                        <motion.span
+                            className="absolute left-1/2 top-1/2 whitespace-nowrap font-bold"
+                            style={{
+                                fontSize: mainFontSize,
+                                color,
+                                transformStyle: 'preserve-3d',
+                                textShadow: wordTextShadow,
+                                WebkitTextStroke: highlightStatus === 'active'
+                                    ? `${(0.45 + strokePulse * 0.5).toFixed(2)}px color-mix(in srgb, ${activeColor} 82%, transparent)`
+                                    : '0px transparent',
+                                filter: depthBlur > 0 ? `blur(${depthBlur.toFixed(2)}px)` : 'none',
+                            }}
+                            initial={{
+                                x: positionedX * 1.12,
+                                y: layout.y + 26,
+                                z: layout.z + (role === 'next' ? intensityPreset.nextWordInitialZ : role === 'previous' ? 140 : -24),
+                                rotateZ: layout.rotateZ + 6,
+                                scale: role === 'next' ? Math.max(0.58, layout.scale - 0.34) : Math.max(0.75, layout.scale - 0.2),
+                                opacity: role === 'next' ? 0.04 : 0,
+                            }}
+                            animate={{
+                                x: positionedX,
+                                y: layout.y + (status === 'active' ? -2 : 0),
+                                z: targetZ,
+                                rotateZ: layout.rotateZ + (status === 'passed' ? 4 : 0),
+                                scale: layout.scale * (status === 'active' ? 1.08 + energy * 0.04 : status === 'waiting' ? 0.9 : 1),
+                                opacity: role === 'next' ? Math.min(alpha, 0.34) : alpha,
+                            }}
+                            transition={{
+                                duration: status === 'active' ? 0.14 : 0.36,
+                                ease: status === 'active' ? 'easeOut' : [0.2, 0.75, 0.25, 1],
+                            }}
+                        >
+                            {glyphCount <= 1 ? (
+                                word.text
+                            ) : (
+                                graphemes.map((grapheme, glyphIndex) => {
                                 // Flowing "Luminous" style: each glyph receives the highlight wave in sequence.
                                 const headStretch = wordRevealMode === 'instant'
                                     ? 0.8
@@ -344,34 +509,55 @@ const SpatialWordCloud: React.FC<{
                                 const tailLength = wordRevealMode === 'instant' ? 2.4 : wordRevealMode === 'fast' ? 3.6 : 4.8;
                                 const lead = clamp(1 - Math.abs(distanceFromHead - 0.1) / leadWidth, 0, 1);
                                 const tail = distanceFromHead >= 0 ? clamp(1 - distanceFromHead / tailLength, 0, 1) : 0;
-                                const glyphEnergy = status === 'active'
+                                const glyphEnergy = highlightStatus === 'active'
                                     ? clamp(lead * 0.95 + tail * 0.52, 0, 1.35)
-                                    : status === 'passed'
+                                    : highlightStatus === 'passed'
                                         ? (0.08 + passedFade * 0.22) * clamp(1 - glyphIndex / Math.max(glyphCount, 1) * 0.35, 0.35, 1)
                                         : 0;
-                                const glyphGlow = Math.max(0, glyphEnergy * (0.85 + energy * 0.2));
-                                const glyphTranslateY = status === 'active' ? -glyphEnergy * 4 : 0;
-                                const glyphScale = status === 'active' ? 1 + glyphEnergy * 0.045 : 1;
+                                const glyphGlow = Math.max(0, glyphEnergy * (0.96 + energy * 0.14));
+                                const glyphGlowMain = Math.round(clamp(glyphGlow, 0, 1) * 100);
+                                const glyphGlowTail = Math.round(clamp(glyphGlow * 0.82, 0, 1) * 100);
+                                const glyphTextShadow = highlightStatus === 'active' && glyphGlow > 0.02
+                                    ? `0 0 ${glowRadii.inner}px color-mix(in srgb, ${activeColor} ${glyphGlowMain}%, transparent), 0 0 ${glowRadii.outer}px color-mix(in srgb, ${activeColor} ${glyphGlowTail}%, transparent)`
+                                    : 'none';
+                                const glyphTranslateY = highlightStatus === 'active' ? -glyphEnergy * 4 : 0;
+                                const glyphScale = highlightStatus === 'active' ? 1 + glyphEnergy * 0.045 : 1;
+                                const entryProgress = highlightStatus === 'active'
+                                    ? clamp(progress * (wordRevealMode === 'instant' ? 2.8 : wordRevealMode === 'fast' ? 2 : 1.55), 0, 1)
+                                    : highlightStatus === 'waiting'
+                                        ? 0
+                                        : 1;
+                                const entryEase = 1 - Math.pow(1 - entryProgress, 2);
+                                const entryAmount = 1 - entryEase;
+                                const arcDirection = glyphIndex % 2 === 0 ? -1 : 1;
+                                const lane = glyphCount <= 1 ? 0.5 : glyphIndex / (glyphCount - 1);
+                                const arcHeight = Math.sin(lane * Math.PI) * (wordRevealMode === 'instant' ? 10 : wordRevealMode === 'fast' ? 13 : 16);
+                                const entryOffsetX = entryAmount * arcDirection * (wordRevealMode === 'instant' ? 8 : 12);
+                                const entryOffsetY = entryAmount * -(14 + arcHeight);
+                                const entryRotate = entryAmount * arcDirection * 7;
+                                const glyphOpacity = highlightStatus === 'waiting'
+                                    ? clamp(0.28 + entryEase * 0.5, 0.28, 0.78)
+                                    : 1;
 
-                                return (
-                                    <span
-                                        key={`${layout.id}-${glyphIndex}`}
-                                        className="inline-block"
-                                        style={{
-                                            transform: `translateY(${glyphTranslateY}px) scale(${glyphScale})`,
-                                            color: status === 'active' && glyphEnergy > 0.08 ? activeColor : color,
-                                            textShadow: glyphGlow > 0.02
-                                                ? `0 0 ${Math.round(16 + glyphGlow * 12)}px color-mix(in srgb, ${activeColor} ${Math.round(clamp(glyphGlow, 0, 1.2) * 100)}%, transparent)`
-                                                : 'none',
-                                            transition: 'transform 90ms ease-out, color 120ms linear, text-shadow 120ms ease-out',
-                                        }}
-                                    >
-                                        {grapheme}
-                                    </span>
-                                );
-                            })
-                        )}
-                    </motion.span>
+                                    return (
+                                        <span
+                                            key={`${layout.id}-${glyphIndex}`}
+                                            className="inline-block"
+                                            style={{
+                                                transform: `translate(${entryOffsetX.toFixed(2)}px, ${(glyphTranslateY + entryOffsetY).toFixed(2)}px) rotate(${entryRotate.toFixed(2)}deg) scale(${glyphScale})`,
+                                                color: highlightStatus === 'active' && glyphEnergy > 0.08 ? activeColor : color,
+                                                textShadow: glyphTextShadow,
+                                                opacity: glyphOpacity,
+                                                transition: 'transform 90ms ease-out, color 120ms linear, text-shadow 120ms ease-out',
+                                            }}
+                                        >
+                                            {grapheme}
+                                        </span>
+                                    );
+                                })
+                            )}
+                        </motion.span>
+                    </React.Fragment>
                 );
             })}
         </motion.div>
@@ -486,6 +672,7 @@ const VisualizerSpatial: React.FC<VisualizerSpatialProps & { staticMode?: boolea
                                 audioPower={audioPower}
                                 now={now}
                                 horizontalScale={horizontalScale}
+                                viewportWidth={contentWidth}
                             />
                         )}
                         {showText && activeLine && (
@@ -498,6 +685,7 @@ const VisualizerSpatial: React.FC<VisualizerSpatialProps & { staticMode?: boolea
                                 audioPower={audioPower}
                                 now={now}
                                 horizontalScale={horizontalScale}
+                                viewportWidth={contentWidth}
                             />
                         )}
                         {showText && upcomingLine && (
@@ -510,6 +698,7 @@ const VisualizerSpatial: React.FC<VisualizerSpatialProps & { staticMode?: boolea
                                 audioPower={audioPower}
                                 now={now}
                                 horizontalScale={horizontalScale}
+                                viewportWidth={contentWidth}
                             />
                         )}
                     </AnimatePresence>
